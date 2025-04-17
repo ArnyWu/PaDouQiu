@@ -1,21 +1,25 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Apr 17 13:32:12 2025
+
+@author: User
+"""
+
 import os
 import zipfile
 import math
 import numpy as np
 import pandas as pd
 from scipy.stats import entropy, kurtosis, skew
-from sklearn.linear_model import LogisticRegression
+
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-# 存檔記得要改檔名不然會被覆蓋掉(在最下面)
 # ==== 資料解壓與讀檔（請依照實際路徑修改）====
 train_zip = r"C:\Users\User\Downloads\39_Training_Dataset.zip"
 test_zip = r"C:\Users\User\Downloads\39_Test_Dataset.zip"
-sample_path = r"C:\Users\User\Downloads\sample_submission.csv"  #更改成他提供的範例路徑(用來比對欄位與筆數是否相同)
 extract_root = "aicup_data"
 
 train_dir = os.path.join(extract_root, "train")
@@ -119,64 +123,74 @@ def FFT_data(input_data, swinging_times):
 
 def extract_fft_features(signal):
     """
-    以手動 FFT 計算信號的頻域特徵
-    參數:
-      signal: 一維數據，代表單一軸的數值序列
-    回傳:
-      字典形式的頻域特徵，包括光譜熵、峰度、偏度與均值
+    以手動 FFT 計算信號的頻域特徵，並攤平成：
+      - fft_entropy, fft_kurtosis, fft_skewness, fft_power
+      - fft_peak1, fft_peak2, fft_peak3 (前三大頻率峰值佔總能量比)
     """
     L = len(signal)
     # 補零至 2 的冪次
     n_fft = 1
     while n_fft < L:
         n_fft *= 2
-    sig_list = list(signal)
-    sig_list += [0] * (n_fft - L)
-    xreal = sig_list.copy()
+    sig = list(signal) + [0] * (n_fft - L)
+    xreal = sig.copy()
     ximag = [0] * n_fft
     n, fft_real, fft_imag = FFT(xreal, ximag)
-    
-    # 計算功率譜密度（PSD）
-    psd = [fft_real[i]**2 + fft_imag[i]**2 for i in range(n)]
-    total_power = sum(psd)
-    if total_power > 0:
-        psd_norm = [p / total_power for p in psd]
-    else:
-        psd_norm = [0] * len(psd)
-    fft_entropy_val = entropy(psd_norm) if total_power > 0 else 0
-    fft_kurtosis_val = kurtosis(psd)
-    fft_skewness_val = skew(psd)
-    fft_power_val = np.mean(psd)
-    
-    return {
-        'fft_entropy': fft_entropy_val,
-        'fft_kurtosis': fft_kurtosis_val,
-        'fft_skewness': fft_skewness_val,
-        'fft_power': fft_power_val
+
+    # 計算功率譜密度 (PSD)
+    psd = np.array([fft_real[i]**2 + fft_imag[i]**2 for i in range(n)])
+    total = psd.sum() + 1e-9
+    psd_norm = psd / total
+
+    feats = {
+        'fft_entropy':  entropy(psd_norm),
+        'fft_kurtosis': kurtosis(psd),
+        'fft_skewness': skew(psd),
+        'fft_power':    psd.mean(),
     }
 
-def extract_segment_features(seg):
+    # 攤平成三大峰值比
+    idxs = np.argsort(psd)[-3:][::-1]
+    for i, idx in enumerate(idxs, start=1):
+        feats[f'fft_peak{i}'] = psd[idx] / total
+
+    return feats
+
+
+def extract_segment_features(seg, seg_id):
     """
-    針對單一段 (seg) 計算所有軸的時間域統計特徵與使用手動 FFT 取得的頻域特徵
+    計算單一段 (seg) 的時域 & 頻域特徵，並加入：
+      - 三軸合成向量 AccMag/GyroMag
+      - seg_id, segment_length
+    回傳一個扁平的 dict，所有特徵都已攤平成欄位。
     """
     features = {}
-    axis_names = ["Ax", "Ay", "Az", "Gx", "Gy", "Gz"]
-    for i, name in enumerate(axis_names):
-        axis_data = seg[:, i]
-        features[f"{name}_mean"] = np.mean(axis_data)
-        features[f"{name}_std"] = np.std(axis_data)
-        features[f"{name}_rms"] = np.sqrt(np.mean(axis_data**2))
-        features[f"{name}_min"] = np.min(axis_data)
-        features[f"{name}_max"] = np.max(axis_data)
-        fft_feat = extract_fft_features(axis_data)
-        for k, v in fft_feat.items():
+
+    # 1. 計算 magnitude
+    acc_mag  = np.linalg.norm(seg[:, :3], axis=1)
+    gyro_mag = np.linalg.norm(seg[:, 3:], axis=1)
+
+    # 2. 通道清單
+    names  = ["Ax","Ay","Az","Gx","Gy","Gz","AccMag","GyroMag"]
+    arrays = [*seg.T, acc_mag, gyro_mag]
+
+    # 3. 時域 + 頻域 特徵
+    for name, arr in zip(names, arrays):
+        # 時域
+        features[f"{name}_mean"] = arr.mean()
+        features[f"{name}_std"]  = arr.std()
+        features[f"{name}_rms"]  = np.sqrt((arr**2).mean())
+        features[f"{name}_min"]  = arr.min()
+        features[f"{name}_max"]  = arr.max()
+        # 頻域
+        fft_feats = extract_fft_features(arr)
+        for k, v in fft_feats.items():
             features[f"{name}_{k}"] = v
-    # 額外計算三軸加速度與陀螺儀向量
-    acc = np.linalg.norm(seg[:, :3], axis=1)
-    gyro = np.linalg.norm(seg[:, 3:], axis=1)
-    features["acc_mean"] = np.mean(acc)
-    features["gyro_mean"] = np.mean(gyro)
+
+    # 4. 段落資訊
+    features["seg_id"]         = seg_id
     features["segment_length"] = len(seg)
+
     return features
 
 
@@ -248,10 +262,10 @@ def create_feature_dataframe(info_df, data_dir, with_labels=True):
             cut_points = [int(x) for x in row["cut_point"].strip("[]").split()]
             cut_points = [0] + cut_points + [len(raw_data)]
             segments = [raw_data[cut_points[i]:cut_points[i+1]] for i in range(min(27, len(cut_points)-1))]
-            for seg in segments:
+            for i, seg in enumerate(segments):
                 if not is_valid_segment(seg):
                     continue
-                feat = extract_segment_features(seg)
+                feat = extract_segment_features(seg, seg_id=i)
                 feat["unique_id"] = uid
                 if with_labels:
                     feat["gender"] = 1 if row["gender"] == 1 else 0
@@ -264,78 +278,98 @@ def create_feature_dataframe(info_df, data_dir, with_labels=True):
     return pd.DataFrame(rows)
 
 # =============================================================================
-# 模型訓練與驗證
+# 模型訓練與驗證 (GroupKFold + GBDT + CatBoost + Macro AUC)
 # =============================================================================
-# 建立訓練資料與驗證集
-train_df = create_feature_dataframe(train_info, os.path.join(train_inner, "train_data"), with_labels=True)
-train_ids, val_ids = train_test_split(train_df["unique_id"].unique(), test_size=0.2, random_state=42)
-train_part = train_df[train_df["unique_id"].isin(train_ids)]
-val_part   = train_df[train_df["unique_id"].isin(val_ids)]
+from sklearn.model_selection import GroupKFold
+from sklearn.ensemble import GradientBoostingClassifier
+from catboost import CatBoostClassifier
 
-# 標準化（移除標籤欄位）
+# 1. 建立訓練資料
+train_df = create_feature_dataframe(train_info, os.path.join(train_inner, "train_data"), with_labels=True)
+print(train_df.columns.tolist())
+
+# 2. 依 unique_id 做 GroupKFold 切分（這裡示範取第一折）
+gkf       = GroupKFold(n_splits=5)
+tr_idx, va_idx = next(gkf.split(train_df, groups=train_df["unique_id"]))
+train_part   = train_df.iloc[tr_idx]
+val_part     = train_df.iloc[va_idx]
+
+# 3. 標準化（移除標籤欄位）
 X_train = train_part.drop(columns=["unique_id", "gender", "hand", "play", "level"])
 X_val   = val_part.drop(columns=["unique_id", "gender", "hand", "play", "level"])
-scaler = StandardScaler()
-X_train_scaled = scaler.fit_transform(X_train)
+scaler  = StandardScaler().fit(X_train)
+X_train_scaled = scaler.transform(X_train)
 X_val_scaled   = scaler.transform(X_val)
 
-# 模型訓練（以 LogisticRegression 為例）
-gender_model = LogisticRegression(solver="lbfgs", max_iter=1000)
-hand_model   = LogisticRegression(solver="lbfgs", max_iter=1000)
-play_model   = LogisticRegression(multi_class="multinomial", solver="saga", max_iter=1000)
-level_model  = LogisticRegression(multi_class="multinomial", solver="saga", max_iter=1000)
+# 4. 定義模型
+#   - 二分類用 GBDT
+gender_model = GradientBoostingClassifier(
+    n_estimators=300, learning_rate=0.05,
+    max_depth=3, subsample=0.8, random_state=42
+)
+hand_model   = GradientBoostingClassifier(
+    n_estimators=300, learning_rate=0.05,
+    max_depth=3, subsample=0.8, random_state=42
+)
+#   - 多分類用 CatBoost
+play_model = CatBoostClassifier(
+    iterations=600, depth=6, learning_rate=0.05,
+    loss_function='MultiClass', random_seed=42, verbose=False
+)
+level_model = CatBoostClassifier(
+    iterations=600, depth=6, learning_rate=0.05,
+    loss_function='MultiClass', random_seed=42, verbose=False
+)
 
+# 5. 訓練
 gender_model.fit(X_train_scaled, train_part["gender"])
-hand_model.fit(X_train_scaled, train_part["hand"])
-play_model.fit(X_train_scaled, train_part["play"])
-level_model.fit(X_train_scaled, train_part["level"])
+hand_model.fit(X_train_scaled,   train_part["hand"])
+play_model.fit(X_train_scaled,   train_part["play"])
+level_model.fit(X_train_scaled,  train_part["level"])
 
-def evaluate_on_val_set(val_df, gender_model, hand_model, play_model, level_model, scaler):
+# 6. 驗證集評估 (Macro AUC)
+def evaluate_on_val_set(val_df):
     print("\n🔍 評估驗證集...")
-    grouped = val_df.groupby("unique_id")
-    preds = []
-    truths = []
-    for uid, group in grouped:
-        X = group.drop(columns=["unique_id", "gender", "hand", "play", "level"])
-        y = group.iloc[0]  # 同一 uid 標籤相同，只取第一筆即可
-        X_scaled = scaler.transform(X)
-        gender_p = gender_model.predict_proba(X_scaled)[:, 1].mean()
-        hand_p   = hand_model.predict_proba(X_scaled)[:, 1].mean()
-        play_p   = play_model.predict_proba(X_scaled).mean(axis=0)
-        level_p  = level_model.predict_proba(X_scaled).mean(axis=0)
+    preds, truths = [], []
+    for uid, group in val_df.groupby("unique_id"):
+        Xg = scaler.transform(group.drop(columns=["unique_id","gender","hand","play","level"]))
+        y  = group.iloc[0]  # 同一 uid 標籤相同
+        # average 機率
+        pg = gender_model.predict_proba(Xg)[:,1].mean()
+        ph = hand_model.predict_proba(Xg)[:,1].mean()
+        pp = play_model.predict_proba(Xg).mean(axis=0)
+        pl = level_model.predict_proba(Xg).mean(axis=0)
         preds.append({
-            "unique_id": uid,
-            "gender": gender_p,
-            "hand": hand_p,
-            "play_0": play_p[0], "play_1": play_p[1], "play_2": play_p[2],
-            "level_2": level_p[0], "level_3": level_p[1],
-            "level_4": level_p[2], "level_5": level_p[3],
+            "gender": pg,
+            "hand":   ph,
+            **{f"play_{i}": pp[i] for i in range(len(pp))},
+            **{f"level_{i+2}": pl[i] for i in range(len(pl))}
         })
         truths.append({
             "gender": y["gender"],
-            "hand": y["hand"],
-            "play": y["play"],
-            "level": y["level"]
+            "hand":   y["hand"],
+            "play":   y["play"],
+            "level":  y["level"]
         })
-    pred_df = pd.DataFrame(preds)
+    pred_df  = pd.DataFrame(preds)
     truth_df = pd.DataFrame(truths)
-    auc_gender = roc_auc_score(truth_df["gender"], pred_df["gender"])
-    auc_hand   = roc_auc_score(truth_df["hand"], pred_df["hand"])
-    y_play = pd.get_dummies(truth_df["play"])
-    y_level = pd.get_dummies(truth_df["level"])
-    auc_play  = roc_auc_score(y_play, pred_df[["play_0", "play_1", "play_2"]], multi_class='ovr', average="micro")
-    auc_level = roc_auc_score(y_level, pred_df[["level_2", "level_3", "level_4", "level_5"]], multi_class='ovr', average="micro")
+    # 計算 Macro AUC
+    auc_gender = roc_auc_score(truth_df["gender"], pred_df["gender"], average="macro")
+    auc_hand   = roc_auc_score(truth_df["hand"],   pred_df["hand"],   average="macro")
+    y_play     = pd.get_dummies(truth_df["play"])
+    y_level    = pd.get_dummies(truth_df["level"])
+    auc_play   = roc_auc_score(y_play,  pred_df.filter(like="play_"),  multi_class='ovr', average="macro")
+    auc_level  = roc_auc_score(y_level, pred_df.filter(like="level_"), multi_class='ovr', average="macro")
     final_score = 0.25 * (auc_gender + auc_hand + auc_play + auc_level)
-    print("\n🎯 驗證集 AUC:")
-    print(f"Gender : {auc_gender:.4f}")
-    print(f"Hand   : {auc_hand:.4f}")
-    print(f"Play   : {auc_play:.4f}")
-    print(f"Level  : {auc_level:.4f}")
-    print(f"Final Score: {final_score:.4f}\n")
+    print(f"Gender AUC : {auc_gender:.4f}")
+    print(f"Hand   AUC : {auc_hand:.4f}")
+    print(f"Play   AUC : {auc_play:.4f}")
+    print(f"Level  AUC : {auc_level:.4f}")
+    print(f"Final AUC : {final_score:.4f}\n")
     return final_score
 
-evaluate_on_val_set(val_part, gender_model, hand_model, play_model, level_model, scaler)
-
+# 執行評估
+evaluate_on_val_set(val_part)
 
 # =============================================================================
 # Test set 預測並輸出結果
@@ -349,38 +383,54 @@ for uid in test_info["unique_id"]:
         row = test_info[test_info["unique_id"] == uid].iloc[0]
         cut_points = [int(x) for x in row["cut_point"].strip("[]").split()]
         cut_points = [0] + cut_points + [len(raw_data)]
-        segments = [raw_data[cut_points[i]:cut_points[i+1]] for i in range(min(27, len(cut_points)-1))]
-        valid_segments = [extract_segment_features(seg) for seg in segments if is_valid_segment(seg)]
-        # 若無 segment 符合條件，取前 100 筆做 fallback
-        if len(valid_segments) == 0:
+        segments = [
+            raw_data[cut_points[i]:cut_points[i+1]]
+            for i in range(min(27, len(cut_points)-1))
+        ]
+
+        # 正確傳入 seg_id
+        valid_feats = []
+        for i, seg in enumerate(segments):
+            if not is_valid_segment(seg):
+                continue
+            valid_feats.append(extract_segment_features(seg, seg_id=i))
+
+        # fallback
+        if not valid_feats:
             fallback_seg = raw_data[:100] if len(raw_data) >= 100 else raw_data
-            valid_segments = [extract_segment_features(fallback_seg)]
-        df_feat = pd.DataFrame(valid_segments)
-        X_scaled = scaler.transform(df_feat)
-        gender_prob = gender_model.predict_proba(X_scaled)[:, 1].mean()
-        hand_prob   = hand_model.predict_proba(X_scaled)[:, 1].mean()
-        play_prob   = play_model.predict_proba(X_scaled).mean(axis=0)
-        level_prob  = level_model.predict_proba(X_scaled).mean(axis=0)
+            valid_feats = [extract_segment_features(fallback_seg, seg_id=0)]
+
+        # 組成 DataFrame、標準化、預測
+        df_feat   = pd.DataFrame(valid_feats)
+        X_scaled  = scaler.transform(df_feat)
+        gender_p  = gender_model.predict_proba(X_scaled)[:,1].mean()
+        hand_p    = hand_model.predict_proba(X_scaled)[:,1].mean()
+        play_p    = play_model.predict_proba(X_scaled).mean(axis=0)
+        level_p   = level_model.predict_proba(X_scaled).mean(axis=0)
+
         all_results.append({
             "unique_id": uid,
-            "gender": round(gender_prob, 4),
-            "hold racket handed": round(hand_prob, 4),
-            "play years_0": round(play_prob[0], 4),
-            "play years_1": round(play_prob[1], 4),
-            "play years_2": round(play_prob[2], 4),
-            "level_2": round(level_prob[0], 4),
-            "level_3": round(level_prob[1], 4),
-            "level_4": round(level_prob[2], 4),
-            "level_5": round(level_prob[3], 4)
+            "gender": round(gender_p,4),
+            "hold racket handed": round(hand_p,4),
+            "play years_0": round(play_p[0],4),
+            "play years_1": round(play_p[1],4),
+            "play years_2": round(play_p[2],4),
+            "level_2": round(level_p[0],4),
+            "level_3": round(level_p[1],4),
+            "level_4": round(level_p[2],4),
+            "level_5": round(level_p[3],4)
         })
     except Exception as e:
         print(f"❌ 無法處理 {uid}: {e}")
         continue
 
+
 sub = pd.DataFrame(all_results)
 sub = sub[["unique_id", "gender", "hold racket handed",
            "play years_0", "play years_1", "play years_2",
            "level_2", "level_3", "level_4", "level_5"]]
+
+sample_path = r"C:\Users\User\Downloads\sample_submission.csv"
 if os.path.exists(sample_path):
     sample = pd.read_csv(sample_path)
     missing_ids = set(sample["unique_id"]) - set(sub["unique_id"])
@@ -395,5 +445,5 @@ if os.path.exists(sample_path):
 else:
     print(f"⚠️ 找不到 sample_submission.csv：{sample_path}")
 
-sub.to_csv("sample_submission_predtry.csv", index=False)
-print("✅ 結果已輸出至 sample_submission_predtry.csv")
+sub.to_csv("sample_submission_predtry1.csv", index=False)
+print("✅ 結果已輸出至 sample_submission_predtry1.csv")
