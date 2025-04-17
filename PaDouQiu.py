@@ -4,7 +4,7 @@ Created on Thu Apr 17 13:32:12 2025
 
 @author: User
 """
-
+# 記得改輸出檔名
 import os
 import zipfile
 import math
@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 train_zip = r"C:\Users\User\Downloads\39_Training_Dataset.zip"
 test_zip = r"C:\Users\User\Downloads\39_Test_Dataset.zip"
 extract_root = "aicup_data"
+sample_path = r"C:\Users\User\Downloads\sample_submission.csv"
 
 train_dir = os.path.join(extract_root, "train")
 test_dir = os.path.join(extract_root, "test")
@@ -278,9 +279,8 @@ def create_feature_dataframe(info_df, data_dir, with_labels=True):
     return pd.DataFrame(rows)
 
 # =============================================================================
-# 模型訓練與驗證 (GroupKFold + GBDT + CatBoost + Macro AUC)
+# 模型訓練與驗證 ( GBDT + CatBoost + Macro AUC)
 # =============================================================================
-from sklearn.model_selection import GroupKFold
 from sklearn.ensemble import GradientBoostingClassifier
 from catboost import CatBoostClassifier
 
@@ -288,11 +288,16 @@ from catboost import CatBoostClassifier
 train_df = create_feature_dataframe(train_info, os.path.join(train_inner, "train_data"), with_labels=True)
 print(train_df.columns.tolist())
 
-# 2. 依 unique_id 做 GroupKFold 切分（這裡示範取第一折）
-gkf       = GroupKFold(n_splits=5)
-tr_idx, va_idx = next(gkf.split(train_df, groups=train_df["unique_id"]))
-train_part   = train_df.iloc[tr_idx]
-val_part     = train_df.iloc[va_idx]
+# 2. 先以 unique_id 做一次 80/20 split
+unique_ids = train_df["unique_id"].unique()
+train_ids, val_ids = train_test_split(
+    unique_ids,
+    test_size=0.2,
+    random_state=42,
+    shuffle=True
+)
+train_part = train_df[train_df["unique_id"].isin(train_ids)].reset_index(drop=True)
+val_part   = train_df[train_df["unique_id"].isin(val_ids)].reset_index(drop=True)
 
 # 3. 標準化（移除標籤欄位）
 X_train = train_part.drop(columns=["unique_id", "gender", "hand", "play", "level"])
@@ -430,7 +435,7 @@ sub = sub[["unique_id", "gender", "hold racket handed",
            "play years_0", "play years_1", "play years_2",
            "level_2", "level_3", "level_4", "level_5"]]
 
-sample_path = r"C:\Users\User\Downloads\sample_submission.csv"
+
 if os.path.exists(sample_path):
     sample = pd.read_csv(sample_path)
     missing_ids = set(sample["unique_id"]) - set(sub["unique_id"])
