@@ -11,6 +11,7 @@ from sklearn.model_selection import train_test_split
 import seaborn as sns
 import matplotlib.pyplot as plt
 
+# 存檔記得要改檔名不然會被覆蓋掉(在最下面)
 # ==== 資料解壓與讀檔（請依照實際路徑修改）====
 train_zip = r"C:\Users\User\Downloads\39_Training_Dataset.zip"
 test_zip = r"C:\Users\User\Downloads\39_Test_Dataset.zip"
